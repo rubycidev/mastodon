@@ -4,24 +4,26 @@ require 'rails_helper'
 require 'mastodon/cli/maintenance'
 
 describe Mastodon::CLI::Maintenance do
-  let(:cli) { described_class.new }
+  subject { cli.invoke(action, arguments, options) }
 
-  describe '.exit_on_failure?' do
-    it 'returns true' do
-      expect(described_class.exit_on_failure?).to be true
-    end
-  end
+  let(:cli) { described_class.new }
+  let(:arguments) { [] }
+  let(:options) { {} }
+
+  it_behaves_like 'CLI Command'
 
   describe '#fix_duplicates' do
+    let(:action) { :fix_duplicates }
+
     context 'when the database version is too old' do
       before do
         allow(ActiveRecord::Migrator).to receive(:current_version).and_return(2000_01_01_000000) # Earlier than minimum
       end
 
       it 'Exits with error message' do
-        expect { cli.invoke :fix_duplicates }.to output(
-          a_string_including('is too old')
-        ).to_stdout.and raise_error(SystemExit)
+        expect { subject }
+          .to output_results('is too old')
+          .and raise_error(SystemExit)
       end
     end
 
@@ -32,9 +34,9 @@ describe Mastodon::CLI::Maintenance do
       end
 
       it 'Exits with error message' do
-        expect { cli.invoke :fix_duplicates }.to output(
-          a_string_including('more recent')
-        ).to_stdout.and raise_error(SystemExit)
+        expect { subject }
+          .to output_results('more recent')
+          .and raise_error(SystemExit)
       end
     end
 
@@ -45,9 +47,82 @@ describe Mastodon::CLI::Maintenance do
       end
 
       it 'Exits with error message' do
-        expect { cli.invoke :fix_duplicates }.to output(
-          a_string_including('Sidekiq is running')
-        ).to_stdout.and raise_error(SystemExit)
+        expect { subject }
+          .to output_results('Sidekiq is running')
+          .and raise_error(SystemExit)
+      end
+    end
+
+    context 'when requirements are met' do
+      before do
+        allow(ActiveRecord::Migrator).to receive(:current_version).and_return(2023_08_22_081029) # The latest migration before the cutoff
+        agree_to_backup_warning
+      end
+
+      context 'with duplicate accounts' do
+        before do
+          prepare_duplicate_data
+        end
+
+        let(:duplicate_account_username) { 'username' }
+        let(:duplicate_account_domain) { 'host.example' }
+
+        it 'runs the deduplication process' do
+          expect { subject }
+            .to output_results(
+              'Deduplicating accounts',
+              'Restoring index_accounts_on_username_and_domain_lower',
+              'Reindexing textual indexes on accounts…',
+              'Finished!'
+            )
+            .and change(duplicate_accounts, :count).from(2).to(1)
+        end
+
+        def duplicate_accounts
+          Account.where(username: duplicate_account_username, domain: duplicate_account_domain)
+        end
+
+        def prepare_duplicate_data
+          ActiveRecord::Base.connection.remove_index :accounts, name: :index_accounts_on_username_and_domain_lower
+          Fabricate(:account, username: duplicate_account_username, domain: duplicate_account_domain)
+          Fabricate.build(:account, username: duplicate_account_username, domain: duplicate_account_domain).save(validate: false)
+        end
+      end
+
+      context 'with duplicate users' do
+        before do
+          prepare_duplicate_data
+        end
+
+        let(:duplicate_email) { 'duplicate@example.host' }
+
+        it 'runs the deduplication process' do
+          expect { subject }
+            .to output_results(
+              'Deduplicating user records',
+              'Restoring users indexes',
+              'Finished!'
+            )
+            .and change(duplicate_users, :count).from(2).to(1)
+        end
+
+        def duplicate_users
+          User.where(email: duplicate_email)
+        end
+
+        def prepare_duplicate_data
+          ActiveRecord::Base.connection.remove_index :users, :email
+          Fabricate(:user, email: duplicate_email)
+          Fabricate.build(:user, email: duplicate_email).save(validate: false)
+        end
+      end
+
+      def agree_to_backup_warning
+        allow(cli.shell)
+          .to receive(:yes?)
+          .with('Continue? (Yes/No)')
+          .and_return(true)
+          .once
       end
     end
   end
